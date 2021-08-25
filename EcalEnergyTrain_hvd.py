@@ -31,7 +31,9 @@ from tensorflow.keras import layers
 from tensorflow.keras.layers import Input
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adadelta, Adam, RMSprop
+from tensorflow.keras.callbacks import CallbackList
 #from tensorflow.keras.utils.generic_utils import Progbar
+import horovod.tensorflow.keras as hvd
 
 #import tensorflow as tf
 #config = tf.ConfigProto(log_device_placement=True)
@@ -66,6 +68,14 @@ def main():
     analysis=True # if analysing
     energies =[100, 200, 300, 400] # Bins
     resultfile = 'results/3dgan_analysis.pkl' # analysis result
+
+    hvd.init()
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    if gpus:
+        tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')
+    print('{}/{}'.format(hvd.rank(), hvd.size()))
 
     # Building discriminator and generator
     d=discriminator()
@@ -102,13 +112,16 @@ def GetprocData(datafile, xscale =1, yscale = 100, limit = 1e-6):
 
 def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, WeightsDir, pklfile, resultfile, mod=0, nb_epochs=30, batch_size=128, latent_size=200, gen_weight=6, aux_weight=0.2, ecal_weight=0.1, lr=0.001, rho=0.9, decay=0.0, g_weights='params_generator_epoch_', d_weights='params_discriminator_epoch_', xscale=1, analysis=False, energies=[]):
     start_init = time.time()
+    opt = getattr(tf.keras.optimizers, 'RMSprop')
+    opt = opt(lr * hvd.size())
+    opt = hvd.DistributedOptimizer(opt)
     verbose = False
     particle = 'Ele'
     f = [0.9, 0.1]
     print('[INFO] Building discriminator')
     #discriminator.summary()
     discriminator.compile(
-        optimizer=RMSprop(),
+        optimizer=opt,
         loss=['binary_crossentropy', 'mean_absolute_percentage_error', 'mean_absolute_percentage_error'],
         loss_weights=[gen_weight, aux_weight, ecal_weight]
         #options=run_options,
@@ -119,7 +132,7 @@ def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, Weigh
     print('[INFO] Building generator')
     #generator.summary()
     generator.compile(
-        optimizer=RMSprop(),
+        optimizer=opt,
         loss='binary_crossentropy'
         #options=run_options,
         #run_metadata=run_metadata
@@ -137,16 +150,53 @@ def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, Weigh
     )
     combined.compile(
         #optimizer=Adam(lr=adam_lr, beta_1=adam_beta_1),
-        optimizer=RMSprop(),
+        optimizer=opt,
         loss=['binary_crossentropy', 'mean_absolute_percentage_error', 'mean_absolute_percentage_error'],
         loss_weights=[gen_weight, aux_weight, ecal_weight]
         #options=run_options,
         #run_metadata=run_metadata
     )
 
+    #warmup_epochs = 0
+    gcb = CallbackList( \
+        callbacks=[ \
+        hvd.callbacks.BroadcastGlobalVariablesCallback(0), \
+        hvd.callbacks.MetricAverageCallback(), \
+        # hvd.callbacks.LearningRateWarmupCallback(warmup_epochs=warmup_epochs, verbose=1), \
+        #hvd.callbacks.LearningRateScheduleCallback(start_epoch=warmup_epochs, end_epoch=nb_epochs, multiplier=1.), \
+        tf.keras.callbacks.ReduceLROnPlateau(patience=10, verbose=1) \
+        ])
+
+    dcb = CallbackList( \
+        callbacks=[ \
+        hvd.callbacks.BroadcastGlobalVariablesCallback(0), \
+        hvd.callbacks.MetricAverageCallback(), \
+        # hvd.callbacks.LearningRateWarmupCallback(warmup_epochs=warmup_epochs, verbose=1), \
+        #hvd.callbacks.LearningRateScheduleCallback(start_epoch=warmup_epochs, end_epoch=nb_epochs, multiplier=1.), \
+        tf.keras.callbacks.ReduceLROnPlateau(patience=10, verbose=1) \
+        ])
+
+    ccb = CallbackList( \
+        callbacks=[ \
+        hvd.callbacks.BroadcastGlobalVariablesCallback(0), \
+        hvd.callbacks.MetricAverageCallback(), \
+        # hvd.callbacks.LearningRateWarmupCallback(warmup_epochs=warmup_epochs, verbose=1), \
+        #hvd.callbacks.LearningRateScheduleCallback(start_epoch=warmup_epochs, end_epoch=nb_epochs, multiplier=1.), \
+        tf.keras.callbacks.ReduceLROnPlateau(patience=10, verbose=1) \
+        ])
+
+    gcb.set_model( generator )
+    dcb.set_model( discriminator )
+    ccb.set_model( combined )
+
+    gcb.on_train_begin()
+    dcb.on_train_begin()
+    ccb.on_train_begin()
+
     # Getting Data
     Trainfiles, Testfiles = gan.DivideFiles(datapath, nEvents=nEvents, EventsperFile = EventsperFile, datasetnames=["ECAL"], Particles =[particle])
-    print('The total data was divided in {} Train files and {} Test files'.format(len(Trainfiles), len(Testfiles)))
+    if hvd.rank()==0:
+        print('The total data was divided in {} Train files and {} Test files'.format(len(Trainfiles), len(Testfiles)))
     nb_test = int(nEvents * f[1])
 
     #Read test data into a single array
@@ -162,22 +212,25 @@ def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, Weigh
     X_test, Y_test, ecal_test = X_test[:nb_test], Y_test[:nb_test], ecal_test[:nb_test]
 
     nb_train = int(nEvents * f[0]) #
-    total_batches = int(nb_train // batch_size)
-    print('In this experiment {} events will be used for training as {}batches'.format(nb_train, total_batches))
-    print('{} events will be used for Testing'.format(nb_test))
+    total_batches = int(nb_train // (batch_size * hvd.size()))
+    if hvd.rank()==0:
+        print('In this experiment {} events will be used for training as {}batches'.format(nb_train, total_batches))
+        print('{} events will be used for Testing'.format(nb_test))
 
     train_history = defaultdict(list)
     test_history = defaultdict(list)
     analysis_history = defaultdict(list)
 
     init_time = time.time()- start_init
-    print('Initialization time is {} seconds'.format(init_time))
+    if hvd.rank()==0:
+        print('Initialization time is {} seconds'.format(init_time))
     for epoch in range(nb_epochs):
         epoch_start = time.time()
-        print('Epoch {} of {}'.format(epoch + 1, nb_epochs))
+        if hvd.rank()==0:
+            print('Epoch {} of {}'.format(epoch + 1, nb_epochs))
         X_train, Y_train, ecal_train = GetprocData(Trainfiles[0], xscale=xscale)
         nb_file=1
-        nb_batches = int(X_train.shape[0] // batch_size)
+        nb_batches = int(X_train.shape[0] / (batch_size * hvd.size()))
         if verbose:
             progress_bar = Progbar(target=total_batches)
 
@@ -192,27 +245,29 @@ def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, Weigh
             if verbose:
                 progress_bar.update(index)
             else:
-                if index % 100 == 0:
+                if hvd.rank()==0 and index % 100 == 0:
                     print('processed {}/{} batches'.format(index + 1, total_batches))
             loaded_data = X_train.shape[0]
-            used_data = file_index * batch_size
-            if (loaded_data - used_data) < batch_size + 1 and (nb_file < len(Trainfiles)):
+            used_data = file_index * batch_size * hvd.size()
+            if (loaded_data - used_data) < batch_size * hvd.size() + 1 and (nb_file < len(Trainfiles)):
                 X_temp, Y_temp, ecal_temp = GetprocData(Trainfiles[nb_file], xscale=xscale)
-                print("\nData file loaded..........",Trainfiles[nb_file])
+                if hvd.rank()==0:
+                    print("\nData file loaded..........",Trainfiles[nb_file])
                 nb_file+=1
-                X_left = X_train[(file_index * batch_size):]
-                Y_left = Y_train[(file_index * batch_size):]
-                ecal_left = ecal_train[(file_index * batch_size):]
+                X_left = X_train[(file_index * batch_size * hvd.size()):]
+                Y_left = Y_train[(file_index * batch_size * hvd.size()):]
+                ecal_left = ecal_train[(file_index * batch_size * hvd.size()):]
                 X_train = np.concatenate((X_left, X_temp))
                 Y_train = np.concatenate((Y_left, Y_temp))
                 ecal_train = np.concatenate((ecal_left, ecal_temp))
-                nb_batches = int(X_train.shape[0] // batch_size)
-                print("{} batches loaded..........".format(nb_batches))
+                nb_batches = int(X_train.shape[0] // (batch_size * hvd.size()))
+                if hvd.rank()==0:
+                    print("{} batches loaded..........".format(nb_batches))
                 file_index = 0
 
-            image_batch = X_train[(file_index * batch_size):(file_index  + 1) * batch_size]
-            energy_batch = Y_train[(file_index * batch_size):(file_index + 1) * batch_size]
-            ecal_batch = ecal_train[(file_index *  batch_size):(file_index + 1) * batch_size]
+            image_batch = X_train[((file_index * hvd.size() + hvd.rank()) * batch_size):(file_index * hvd.size() + hvd.rank() + 1) * batch_size]
+            energy_batch = Y_train[((file_index * hvd.size() + hvd.rank()) * batch_size):(file_index * hvd.size() + hvd.rank() + 1) * batch_size]
+            ecal_batch = ecal_train[((file_index * hvd.size() + hvd.rank()) *  batch_size):(file_index * hvd.size() + hvd.rank() + 1) * batch_size]
             file_index +=1
             noise = np.random.normal(0, 1, (batch_size, latent_size))
             sampled_energies = np.random.uniform(0.1, 5,( batch_size,1 ))
@@ -246,12 +301,13 @@ def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, Weigh
             epoch_gen_loss.append([
                 (a + b) / 2 for a, b in zip(*gen_losses)
             ])
-        print('The training took {} seconds.'.format(time.time()-epoch_start))
-        print('dur_d took {} seconds.'.format(dur_d))
-        print('dur_g took {} seconds.'.format(dur_g))
-        print('dur_c took {} seconds.'.format(dur_c))
-        print('dur all took {} seconds.'.format(dur_d + dur_g + dur_c))
-        print('\nTesting for epoch {}:'.format(epoch + 1))
+        if hvd.rank()==0:
+            print('The training took {} seconds.'.format(time.time()-epoch_start))
+            print('dur_d took {} seconds.'.format(dur_d))
+            print('dur_g took {} seconds.'.format(dur_g))
+            print('dur_c took {} seconds.'.format(dur_c))
+            print('dur all took {} seconds.'.format(dur_d + dur_g + dur_c))
+            print('\nTesting for epoch {}:'.format(epoch + 1))
         test_start=time.time()
         noise = np.random.normal(0.1, 1, (nb_test, latent_size))
         sampled_energies = np.random.uniform(0.1, 5, (nb_test, 1))
@@ -280,38 +336,39 @@ def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, Weigh
         test_history['generator'].append(generator_test_loss)
         test_history['discriminator'].append(discriminator_test_loss)
 
-        print('{0:<22s} | {1:4s} | {2:15s} | {3:5s}| {4:5s}'.format(
-            'component', *discriminator.metrics_names))
-        print('-' * 65)
+        if hvd.rank()==0:
+            print('{0:<22s} | {1:4s} | {2:15s} | {3:5s}| {4:5s}'.format(
+                'component', *discriminator.metrics_names))
+            print('-' * 65)
 
-        ROW_FMT = '{0:<22s} | {1:<4.2f} | {2:<15.2f} | {3:<5.2f}| {4:<5.2f}'
-        print(ROW_FMT.format('generator (train)',
-                             *train_history['generator'][-1]))
-        print(ROW_FMT.format('generator (test)',
-                             *test_history['generator'][-1]))
-        print(ROW_FMT.format('discriminator (train)',
-                             *train_history['discriminator'][-1]))
-        print(ROW_FMT.format('discriminator (test)',
+            ROW_FMT = '{0:<22s} | {1:<4.2f} | {2:<15.2f} | {3:<5.2f}| {4:<5.2f}'
+            print(ROW_FMT.format('generator (train)',
+                                 *train_history['generator'][-1]))
+            print(ROW_FMT.format('generator (test)',
+                                 *test_history['generator'][-1]))
+            print(ROW_FMT.format('discriminator (train)',
+                                 *train_history['discriminator'][-1]))
+            print(ROW_FMT.format('discriminator (test)',
                              *test_history['discriminator'][-1]))
 
-        # save weights every epoch
-        generator.save_weights(WeightsDir + '/{0}{1:03d}.hdf5'.format(g_weights, epoch),
-                               overwrite=True)
-        discriminator.save_weights(WeightsDir + '/{0}{1:03d}.hdf5'.format(d_weights, epoch),
+            # save weights every epoch
+            generator.save_weights(WeightsDir + '/{0}{1:03d}.hdf5'.format(g_weights, epoch),
                                    overwrite=True)
-        print("The Testing for {} epoch took {} seconds. Weights are saved in {}".format(epoch, time.time()-test_start, WeightsDir))
-        pickle.dump({'train': train_history, 'test': test_history},
-        open(pklfile, 'wb'))
-        if analysis:
-            var = gan.sortEnergy([X_test, Y_test], ecal_test, energies, ang=0)
-            result = gan.OptAnalysisShort(var, generated_images, energies, ang=0)
-            print('Analysing............')
-            # All of the results correspond to mean relative errors on different quantities
-            analysis_history['total'].append(result[0])
-            analysis_history['energy'].append(result[1])
-            analysis_history['moment'].append(result[2])
-            print('Result = ', result)
-            pickle.dump({'results': analysis_history}, open(resultfile, 'wb'))
+            discriminator.save_weights(WeightsDir + '/{0}{1:03d}.hdf5'.format(d_weights, epoch),
+                                       overwrite=True)
+            print("The Testing for {} epoch took {} seconds. Weights are saved in {}".format(epoch, time.time()-test_start, WeightsDir))
+            pickle.dump({'train': train_history, 'test': test_history},
+            open(pklfile, 'wb'))
+            if analysis:
+                var = gan.sortEnergy([X_test, Y_test], ecal_test, energies, ang=0)
+                result = gan.OptAnalysisShort(var, generated_images, energies, ang=0)
+                print('Analysing............')
+                # All of the results correspond to mean relative errors on different quantities
+                analysis_history['total'].append(result[0])
+                analysis_history['energy'].append(result[1])
+                analysis_history['moment'].append(result[2])
+                print('Result = ', result)
+                pickle.dump({'results': analysis_history}, open(resultfile, 'wb'))
 
 def get_parser():
     parser = argparse.ArgumentParser(description='3D GAN Params' )
