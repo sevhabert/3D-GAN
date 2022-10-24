@@ -228,7 +228,6 @@ def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, Weigh
             ecal_train = np.concatenate((ecal_train, ecal_temp))
 
     nb_test = X_test.shape[0]
-    assert X_train.shape[0] == EventsperFile * len(Trainfiles), "# Total events in training files"
     nb_train = X_train.shape[0]# Total events in training files
     total_batches = int(nb_train / batch_size)
 
