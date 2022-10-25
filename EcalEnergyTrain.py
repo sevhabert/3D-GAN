@@ -39,6 +39,43 @@ from tensorflow.keras.optimizers import Adadelta, Adam, RMSprop
 #run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
 #run_metadata = tf.RunMetadata()
 
+def DivideFiles(FileSearch="/data/LCD/*/*.h5", nEvents=200000, EventsperFile = 10000, Fractions=[.9,.1],datasetnames=["ECAL","HCAL"],Particles=[],MaxFiles=-1):
+
+    Files =sorted( glob.glob(FileSearch))
+    Filesused = int(math.ceil(nEvents/EventsperFile))
+    FileCount=0
+
+    Samples={}
+    for F in Files:
+        FileCount+=1
+        basename=os.path.basename(F)
+        ParticleName=basename.split("_")[0].replace("Escan","")
+
+        if ParticleName in Particles:
+            try:
+                Samples[ParticleName].append(F)
+            except:
+                Samples[ParticleName]=[(F)]
+
+        if MaxFiles>0:
+            if FileCount>MaxFiles:
+                break
+    out=[]
+    for j in range(len(Fractions)):
+        out.append([])
+
+    SampleI=len(Samples.keys())*[int(0)]
+
+    for i,SampleName in enumerate(Samples):
+        Sample=Samples[SampleName][:Filesused]
+        NFiles=len(Sample)
+
+        for j,Frac in enumerate(Fractions):
+            EndI=int(SampleI[i]+ round(NFiles*Frac))
+            out[j]+=Sample[SampleI[i]:EndI]
+            SampleI[i]=EndI
+    return out
+
 #import setGPU #if Caltech
 def safe_mkdir(path):
    #Safe mkdir (i.e., don't create if already exists,and no violation of race conditions)
@@ -199,7 +236,7 @@ def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, Weigh
     )
 
     # Getting Data
-    Trainfiles, Testfiles = gan.DivideFiles(datapath, nEvents=nEvents, EventsperFile = EventsperFile, datasetnames=["ECAL"], Particles =[particle])
+    Trainfiles, Testfiles = DivideFiles(datapath, nEvents=nEvents, EventsperFile = EventsperFile, datasetnames=["ECAL"], Particles =[particle])
     #Trainfiles, Testfiles = gan.DivideFiles(datapath, nEvents=nEvents, EventsperFile = EventsperFile, datasetnames=["ECAL"], Particles =[particle], Fractions=[.5,.5])
 
     print(Trainfiles)
