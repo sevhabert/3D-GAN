@@ -34,6 +34,7 @@ from tensorflow.keras.optimizers import Adadelta, Adam, RMSprop
 from tensorflow.keras.callbacks import CallbackList
 #from tensorflow.keras.utils.generic_utils import Progbar
 import horovod.tensorflow.keras as hvd
+import horovod.tensorflow
 
 #import tensorflow as tf
 #config = tf.ConfigProto(log_device_placement=True)
@@ -199,29 +200,63 @@ def GetprocData(datafile, xscale =1, yscale = 100, limit = 1e-6):
     ecal = np.sum(X, axis=(1, 2, 3))
     return X, Y, ecal
 
+@tf.function
+def tf_function_discriminator_train(model, x_train, y_train, loss_fn, loss_weight, optimizer):
+    with tf.GradientTape() as tape:
+        fake, aux, ecal = model(x_train, training=True)
+        fake = tf.squeeze(fake)
+        loss0 = loss_fn[0](y_train[0], fake)
+        loss1 = loss_fn[1](y_train[1], aux)
+        loss2 = loss_fn[2](y_train[2], ecal)
+        loss = loss0 * loss_weight[0] + loss1 * loss_weight[1] + loss2 * loss_weight[2]
+        #print(loss0, loss1, loss2, loss)
+    tape = horovod.tensorflow.DistributedGradientTape(tape)
+    grads = tape.gradient(loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(grads, model.trainable_variables))
+    return [loss, loss0, loss1, loss2]
+
+@tf.function
+def tf_function_generator_predict(generator, x_train):
+    return generator(x_train, training = True)
+
+@tf.function
+def tf_function_combined_train(generator, discriminator, x_train, y_train, loss_fn, loss_weight, optimizer):
+    with tf.GradientTape() as tape:
+        fake_image = generator(x_train, training = True)
+        fake, aux, ecal = discriminator(fake_image, training = True)
+        fake = tf.squeeze(fake)
+        loss0 = loss_fn[0](y_train[0], fake)
+        loss1 = loss_fn[1](y_train[1], aux)
+        loss2 = loss_fn[2](y_train[2], ecal)
+        loss = loss0 * loss_weight[0] + loss1 * loss_weight[1] + loss2 * loss_weight[2]
+        #print(loss0, loss1, loss2, loss)
+    tape = horovod.tensorflow.DistributedGradientTape(tape)
+    grads = tape.gradient(loss, generator.trainable_variables)
+    optimizer.apply_gradients(zip(grads, generator.trainable_variables))
+    return [loss, loss0, loss1, loss2]
+
 def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, WeightsDir, pklfile, resultfile, mod=0, nb_epochs=30, batch_size=128, latent_size=200, gen_weight=6, aux_weight=0.2, ecal_weight=0.1, lr=0.001, rho=0.9, decay=0.0, g_weights='params_generator_epoch_', d_weights='params_discriminator_epoch_', xscale=1, analysis=False, energies=[]):
     start_init = time.time()
-    opt = getattr(tf.keras.optimizers, 'RMSprop')
-    opt = opt(lr * hvd.size())
-    opt = hvd.DistributedOptimizer(opt)
     verbose = False
     particle = 'Ele'
     f = [0.9, 0.1]
     print('[INFO] Building discriminator')
     #discriminator.summary()
+    discriminator_optimizer = RMSprop(lr = lr * hvd.size())
+    discriminator_loss_fn1 = tf.keras.losses.BinaryCrossentropy()
+    discriminator_loss_fn2 = tf.keras.losses.MeanAbsolutePercentageError()
+    discriminator_loss_fn3 = tf.keras.losses.MeanAbsolutePercentageError()
     discriminator.compile(
-        optimizer=opt,
-        loss=['binary_crossentropy', 'mean_absolute_percentage_error', 'mean_absolute_percentage_error'],
-        loss_weights=[gen_weight, aux_weight, ecal_weight]
+        optimizer=discriminator_optimizer,
+        loss=[discriminator_loss_fn1, discriminator_loss_fn2, discriminator_loss_fn3],
+        loss_weights=[gen_weight, aux_weight, ecal_weight],
         #options=run_options,
         #run_metadata=run_metadata
     )
-
-    # build the generator
     print('[INFO] Building generator')
     #generator.summary()
     generator.compile(
-        optimizer=opt,
+        optimizer=RMSprop(lr = lr * hvd.size()),
         loss='binary_crossentropy'
         #options=run_options,
         #run_metadata=run_metadata
@@ -237,10 +272,14 @@ def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, Weigh
         outputs=[fake, aux, ecal], ### modif
         name='combined_model'
     )
+    combined_optimizer = RMSprop(lr = lr * hvd.size())
+    combined_loss_fn1 = tf.keras.losses.BinaryCrossentropy()
+    combined_loss_fn2 = tf.keras.losses.MeanAbsolutePercentageError()
+    combined_loss_fn3 = tf.keras.losses.MeanAbsolutePercentageError()
     combined.compile(
         #optimizer=Adam(lr=adam_lr, beta_1=adam_beta_1),
-        optimizer=opt,
-        loss=['binary_crossentropy', 'mean_absolute_percentage_error', 'mean_absolute_percentage_error'],
+        optimizer=combined_optimizer,
+        loss=[combined_loss_fn1, combined_loss_fn2, combined_loss_fn3],
         loss_weights=[gen_weight, aux_weight, ecal_weight]
         #options=run_options,
         #run_metadata=run_metadata
@@ -345,12 +384,20 @@ def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, Weigh
 
             #ecal sum from fit
             ecal_ip = gan.GetEcalFit(sampled_energies, particle,mod, xscale)
-            generated_images = generator.predict(generator_ip, verbose=0)
-            real_batch_loss = discriminator.train_on_batch(image_batch, [gan.BitFlip(np.ones(batch_size)), energy_batch, ecal_batch])
-            fake_batch_loss = discriminator.train_on_batch(generated_images, [gan.BitFlip(np.zeros(batch_size)), sampled_energies, ecal_ip])
+            generated_images = tf_function_generator_predict(generator, generator_ip)
+            discriminator.trainable = True
+            real_batch_loss = tf_function_discriminator_train(discriminator, image_batch, [gan.BitFlip(np.ones(batch_size)), energy_batch, ecal_batch],
+                    [discriminator_loss_fn1, discriminator_loss_fn2, discriminator_loss_fn3],
+                    [gen_weight, aux_weight, ecal_weight],
+                    discriminator_optimizer)
+            fake_batch_loss = tf_function_discriminator_train(discriminator, generated_images, [gan.BitFlip(np.zeros(batch_size)), sampled_energies, ecal_ip],
+                    [discriminator_loss_fn1, discriminator_loss_fn2, discriminator_loss_fn3],
+                    [gen_weight, aux_weight, ecal_weight],
+                    discriminator_optimizer)
             epoch_disc_loss.append([
                 (a + b) / 2 for a, b in zip(real_batch_loss, fake_batch_loss)
             ])
+            discriminator.trainable = False
 
             trick = np.ones(batch_size)
             gen_losses = []
@@ -359,9 +406,12 @@ def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, Weigh
                 sampled_energies = np.random.uniform(0.1, 5, ( batch_size,1 ))
                 generator_ip = np.multiply(sampled_energies, noise)
                 ecal_ip = gan.GetEcalFit(sampled_energies, particle, mod, xscale)
-                gen_losses.append(combined.train_on_batch(
-                    [generator_ip],
-                    [trick, sampled_energies.reshape((-1, 1)), ecal_ip]))
+                combined_loss = tf_function_combined_train(generator, discriminator, generator_ip, [trick, sampled_energies.reshape((-1, 1)), ecal_ip],
+                    [combined_loss_fn1, combined_loss_fn2, combined_loss_fn3],
+                    [gen_weight, aux_weight, ecal_weight],
+                    combined_optimizer)
+                gen_losses.append(combined_loss)
+
             epoch_gen_loss.append([
                 (a + b) / 2 for a, b in zip(*gen_losses)
             ])
