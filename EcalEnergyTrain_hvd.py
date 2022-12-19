@@ -210,7 +210,7 @@ def tf_function_discriminator_train(model, x_train, y_train, loss_fn, loss_weigh
         loss2 = loss_fn[2](y_train[2], ecal)
         loss = loss0 * loss_weight[0] + loss1 * loss_weight[1] + loss2 * loss_weight[2]
         #print(loss0, loss1, loss2, loss)
-    tape = horovod.tensorflow.DistributedGradientTape(tape)
+    tape = horovod.tensorflow.DistributedGradientTape(tape, groups=1)
     grads = tape.gradient(loss, model.trainable_variables)
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
     return [loss, loss0, loss1, loss2]
@@ -230,7 +230,7 @@ def tf_function_combined_train(generator, discriminator, x_train, y_train, loss_
         loss2 = loss_fn[2](y_train[2], ecal)
         loss = loss0 * loss_weight[0] + loss1 * loss_weight[1] + loss2 * loss_weight[2]
         #print(loss0, loss1, loss2, loss)
-    tape = horovod.tensorflow.DistributedGradientTape(tape)
+    tape = horovod.tensorflow.DistributedGradientTape(tape, groups=1)
     grads = tape.gradient(loss, generator.trainable_variables)
     optimizer.apply_gradients(zip(grads, generator.trainable_variables))
     return [loss, loss0, loss1, loss2]
@@ -243,8 +243,6 @@ def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, Weigh
     print('[INFO] Building discriminator')
     #discriminator.summary()
     discriminator_optimizer = RMSprop(learning_rate = lr * hvd.size())
-    # add Horovod Distributed Optimizer
-    discriminator_optimizer = hvd.DistributedOptimizer(discriminator_optimizer, num_groups=1)
     discriminator_loss_fn1 = tf.keras.losses.BinaryCrossentropy()
     discriminator_loss_fn2 = tf.keras.losses.MeanAbsolutePercentageError()
     discriminator_loss_fn3 = tf.keras.losses.MeanAbsolutePercentageError()
@@ -258,7 +256,6 @@ def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, Weigh
     print('[INFO] Building generator')
     #generator.summary()
     generator_optimizer = RMSprop(learning_rate = lr * hvd.size())
-    generator_optimizer = hvd.DistributedOptimizer(generator_optimizer, num_groups=1)
     generator.compile(
         optimizer=generator_optimizer,
         loss='binary_crossentropy'
@@ -277,7 +274,6 @@ def Gan3DTrain(discriminator, generator, datapath, EventsperFile, nEvents, Weigh
         name='combined_model'
     )
     combined_optimizer = RMSprop(learning_rate = lr * hvd.size())
-    combined_optimizer = hvd.DistributedOptimizer(combined_optimizer, num_groups=1)
     combined_loss_fn1 = tf.keras.losses.BinaryCrossentropy()
     combined_loss_fn2 = tf.keras.losses.MeanAbsolutePercentageError()
     combined_loss_fn3 = tf.keras.losses.MeanAbsolutePercentageError()
